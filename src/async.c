@@ -40,7 +40,11 @@ void fastd_async_init(void) {
 	ctx.async_rfd = FASTD_POLL_FD(POLL_TYPE_ASYNC, fds[0]);
 	ctx.async_wfd = fds[1];
 
+#ifdef HAVE_LIBURING
+	ctx.func_fd_register(&ctx.async_rfd);
+#else
 	fastd_poll_fd_register(&ctx.async_rfd);
+#endif
 }
 
 /** Handles a DNS resolver response */
@@ -76,65 +80,127 @@ static void handle_verify_return(const fastd_async_verify_return_t *verify_retur
 
 #endif
 
+struct async_priv {
+	struct msghdr msg;
+	struct iovec vec[2];
+	fastd_async_hdr_t header;
+	uint8_t *buf;
+};
+
+#ifdef HAVE_LIBURING
+/* forward declaration */
+void fastd_async_handle_callback_first(ssize_t ret, void *p);
+void fastd_async_handle_callback_second(ssize_t ret, void *p);
+#endif
 
 /** Reads and handles a single notification from the async notification socket */
 void fastd_async_handle(void) {
-	fastd_async_hdr_t header;
-	struct iovec vec[2] = {
-		{ .iov_base = &header, .iov_len = sizeof(header) },
-	};
-	struct msghdr msg = {
-		.msg_iov = vec,
-		.msg_iovlen = 1,
-	};
+#ifdef HAVE_LIBURING
+	struct async_priv *priv = fastd_new_aligned(struct async_priv, 16);
+#else
+	uint8_t tmp_priv[sizeof(struct async_priv)] __attribute__((aligned(8))) = {};
+	struct async_priv *priv = tmp_priv;
+#endif
 
-	if (recvmsg(ctx.async_rfd.fd, &msg, MSG_PEEK) < 0)
+	priv->vec[0].iov_base = &priv->header;
+	priv->vec[0].iov_len = sizeof(priv->header);
+
+	priv->msg.msg_iov = priv->vec;
+	priv->msg.msg_iovlen = 1;
+
+#ifndef HAVE_LIBURING
+	ssize_t ret = recvmsg(ctx.async_rfd.fd, &priv->msg, MSG_PEEK)
+#else
+	ctx.func_recvmsg(&ctx.async_rfd, &priv->msg, MSG_PEEK, priv, fastd_async_handle_callback_first);
+}
+
+void fastd_async_handle_callback_first(ssize_t ret, void *p) {
+	struct async_priv *priv = p;
+#endif
+
+	if (ret < 0)
 		exit_errno("fastd_async_handle: recvmsg");
 
-	uint8_t buf[header.len] __attribute__((aligned(8)));
-	vec[1].iov_base = buf;
-	vec[1].iov_len = sizeof(buf);
-	msg.msg_iovlen = 2;
+#ifdef HAVE_LIBURING
+	priv->buf = fastd_alloc_aligned(priv->header.len, 16);
+#else
+	uint8_t buf[priv->header.len] __attribute__((aligned(8)));
+	priv->buf = buf;
+#endif
+	priv->vec[1].iov_base = priv->buf;
+	priv->vec[1].iov_len = sizeof(priv->buf);
+	priv->msg.msg_iovlen = 2;
 
-	if (recvmsg(ctx.async_rfd.fd, &msg, 0) < 0)
+#ifndef HAVE_LIBURING
+	ret = recvmsg(ctx.async_rfd.fd, &priv->msg, 0);
+#else
+	ctx.func_recvmsg(&ctx.async_rfd, &priv->msg, 0, priv, fastd_async_handle_callback_second);
+}
+
+void fastd_async_handle_callback_second(ssize_t ret, void *p) {
+	struct async_priv *priv = p;
+#endif
+	if (ret < 0)
 		exit_errno("fastd_async_handle: recvmsg");
 
-	switch (header.type) {
+	switch (priv->header.type) {
 	case ASYNC_TYPE_NOP:
 		break;
 
 	case ASYNC_TYPE_RESOLVE_RETURN:
-		handle_resolve_return((const fastd_async_resolve_return_t *)buf);
+		handle_resolve_return((const fastd_async_resolve_return_t *)priv->buf);
 		break;
 
 #ifdef WITH_DYNAMIC_PEERS
 	case ASYNC_TYPE_VERIFY_RETURN:
-		handle_verify_return((const fastd_async_verify_return_t *)buf);
+		handle_verify_return((const fastd_async_verify_return_t *)priv->buf);
 		break;
 #endif
 
 	default:
 		exit_bug("fastd_async_handle: unknown type");
 	}
+
+#ifdef HAVE_LIBURING
+	free(priv->buf);
+	free(priv);
+#endif
 }
+
+#ifdef HAVE_LIBURING
+/* forward declaration */
+void fastd_async_enqueue_callback(ssize_t ret, void *p);
+#endif
 
 /** Enqueues a new async notification */
 void fastd_async_enqueue(fastd_async_type_t type, const void *data, size_t len) {
-	fastd_async_hdr_t header;
+#ifdef HAVE_LIBURING
+	struct async_priv *priv = fastd_new_aligned(struct async_priv, 16);
+#else
+	uint8_t tmp_priv[sizeof(struct async_priv)] __attribute__((aligned(8))) = {};
+	struct async_priv *priv = tmp_priv;
+#endif
 	/* use memset to zero the holes in the struct to make valgrind happy */
-	memset(&header, 0, sizeof(header));
-	header.type = type;
-	header.len = len;
+	memset(&priv->header, 0, sizeof(priv->header));
+	priv->header.type = type;
+	priv->header.len = len;
 
-	struct iovec vec[2] = {
-		{ .iov_base = &header, .iov_len = sizeof(header) },
-		{ .iov_base = (void *)data, .iov_len = len },
-	};
-	struct msghdr msg = {
-		.msg_iov = vec,
-		.msg_iovlen = len ? 2 : 1,
-	};
+	priv->vec[0].iov_base = &priv->header;
+	priv->vec[0].iov_len = sizeof(priv->header);
+	priv->vec[1].iov_base = (void *)data;
+	priv->vec[1].iov_len = len;
 
-	if (sendmsg(ctx.async_wfd, &msg, 0) < 0)
+	priv->msg.msg_iov = priv->vec;
+	priv->msg.msg_iovlen = len ? 2 : 1;
+
+#ifndef HAVE_LIBURING
+	ssize_t ret = sendmsg(ctx.async_wfd.fd, &priv->msg, 0);
+#else
+	ctx.func_sendmsg(&ctx.async_rfd, &priv->msg, 0, priv, fastd_async_enqueue_callback);
+}
+
+void fastd_async_enqueue_callback(ssize_t ret, void *p) {
+#endif
+	if (ret < 0)
 		pr_warn_errno("fastd_async_enqueue: sendmsg");
 }

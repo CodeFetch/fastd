@@ -65,6 +65,23 @@ static inline void add_pktinfo(struct msghdr *msg, const fastd_peer_address_t *l
 	}
 }
 
+struct send_priv {
+	uint8_t cbuf[1024];
+	fastd_buffer_t buffer;
+	uint8_t packet_type;
+	fastd_peer_t *peer;
+	fastd_peer_address_t remote_addr6;
+	fastd_poll_fd_t fd;
+	size_t stat_size;
+	struct iovec iov[2];
+	struct msghdr msg;
+};
+
+#ifdef HAVE_LIBURING
+/* forward declaration */
+void fastd_send_callback_first(ssize_t ret, void *p);
+#endif
+
 /** Sends a packet of a given type */
 static void send_type(
 	const fastd_socket_t *sock, const fastd_peer_address_t *local_addr, const fastd_peer_address_t *remote_addr,
@@ -72,19 +89,30 @@ static void send_type(
 	if (!sock)
 		exit_bug("send: sock == NULL");
 
-	struct msghdr msg = {};
-	uint8_t cbuf[1024] __attribute__((aligned(8))) = {};
-	fastd_peer_address_t remote_addr6;
+#ifdef HAVE_LIBURING
+	struct send_priv *priv = fastd_new_aligned(struct send_priv, 16);
+#else
+	uint8_t tmp_priv[sizeof(struct send_priv)] __attribute__((aligned(8))) = {};
+	struct send_priv *priv = tmp_priv;
+#endif
+
+	priv->buffer = buffer;
+	priv->packet_type = packet_type;
+	priv->peer = peer;
+	memcpy(&priv->fd, &sock->fd, sizeof(priv->fd));
+	priv->stat_size = stat_size;
+
+	/* TODO: find out if using remote_addr is save */
 
 	switch (remote_addr->sa.sa_family) {
 	case AF_INET:
-		msg.msg_name = (void *)&remote_addr->in;
-		msg.msg_namelen = sizeof(struct sockaddr_in);
+		priv->msg.msg_name = (void *)&remote_addr->in;
+		priv->msg.msg_namelen = sizeof(struct sockaddr_in);
 		break;
 
 	case AF_INET6:
-		msg.msg_name = (void *)&remote_addr->in6;
-		msg.msg_namelen = sizeof(struct sockaddr_in6);
+		priv->msg.msg_name = (void *)&remote_addr->in6;
+		priv->msg.msg_namelen = sizeof(struct sockaddr_in6);
 		break;
 
 	default:
@@ -92,43 +120,66 @@ static void send_type(
 	}
 
 	if (sock->bound_addr->sa.sa_family == AF_INET6) {
-		remote_addr6 = *remote_addr;
-		fastd_peer_address_widen(&remote_addr6);
+		priv->remote_addr6 = *remote_addr;
+		fastd_peer_address_widen(&priv->remote_addr6);
 
-		msg.msg_name = (void *)&remote_addr6.in6;
-		msg.msg_namelen = sizeof(struct sockaddr_in6);
+		priv->msg.msg_name = (void *)&priv->remote_addr6.in6;
+		priv->msg.msg_namelen = sizeof(struct sockaddr_in6);
 	}
 
-	struct iovec iov[2] = { { .iov_base = &packet_type, .iov_len = 1 },
-				{ .iov_base = buffer.data, .iov_len = buffer.len } };
+	priv->iov[0].iov_base = &priv->packet_type;
+	priv->iov[0].iov_len = 1;
+	priv->iov[1].iov_base = buffer.data;
+	priv->iov[1].iov_len = buffer.len;
 
-	msg.msg_iov = iov;
-	msg.msg_iovlen = buffer.len ? 2 : 1;
-	msg.msg_control = cbuf;
-	msg.msg_controllen = 0;
+	priv->msg.msg_iov = priv->iov;
+	priv->msg.msg_iovlen = buffer.len ? 2 : 1;
+	priv->msg.msg_control = priv->cbuf;
+	priv->msg.msg_controllen = 0;
 
-	add_pktinfo(&msg, local_addr);
+	add_pktinfo(&priv->msg, local_addr);
 
-	if (!msg.msg_controllen)
-		msg.msg_control = NULL;
+	if (!priv->msg.msg_controllen)
+		priv->msg.msg_control = NULL;
 
-	int ret = sendmsg(sock->fd.fd, &msg, 0);
+#ifndef HAVE_LIBURING
+	int ret = sendmsg(sock->fd.fd, &priv->msg, 0);
+#else
+	ctx.func_sendmsg(&priv->fd, &priv->msg, 0, priv, fastd_send_callback_first);
+}
 
-	if (ret < 0 && msg.msg_controllen) {
+/* forward declaration */
+void fastd_send_callback_second(ssize_t ret, void *p);
+
+void fastd_send_callback_first(ssize_t ret, void *p) {
+	struct send_priv *priv = p;
+#endif
+	if (ret < 0 && priv->msg.msg_controllen) {
 		switch (errno) {
 		case EINVAL:
 		case ENETUNREACH:
 			pr_debug2("sendmsg: %s (trying again without pktinfo)", strerror(errno));
 
-			if (peer && !fastd_peer_handshake_scheduled(peer))
-				fastd_peer_schedule_handshake_default(peer);
+			if (priv->peer && !fastd_peer_handshake_scheduled(priv->peer))
+				fastd_peer_schedule_handshake_default(priv->peer);
 
-			msg.msg_control = NULL;
-			msg.msg_controllen = 0;
+			priv->msg.msg_control = NULL;
+			priv->msg.msg_controllen = 0;
 
-			ret = sendmsg(sock->fd.fd, &msg, 0);
+#ifdef HAVE_LIBURING
+			ctx.func_sendmsg(&priv->fd, &priv->msg, 0, priv, fastd_send_callback_second);
+#else
+			ret = sendmsg(priv->fd.fd, &priv->msg, 0);
+#endif
 		}
 	}
+
+#ifdef HAVE_LIBURING
+}
+
+void fastd_send_callback_second(ssize_t ret, void *p) {
+	struct send_priv *priv = p;
+#endif
 
 	if (ret < 0) {
 		switch (errno) {
@@ -137,25 +188,29 @@ static void send_type(
 		case EWOULDBLOCK:
 #endif
 			pr_debug2_errno("sendmsg");
-			fastd_stats_add(peer, STAT_TX_DROPPED, stat_size);
+			fastd_stats_add(priv->peer, STAT_TX_DROPPED, priv->stat_size);
 			break;
 
 		case ENETDOWN:
 		case ENETUNREACH:
 		case EHOSTUNREACH:
 			pr_debug_errno("sendmsg");
-			fastd_stats_add(peer, STAT_TX_ERROR, stat_size);
+			fastd_stats_add(priv->peer, STAT_TX_ERROR, priv->stat_size);
 			break;
 
 		default:
 			pr_warn_errno("sendmsg");
-			fastd_stats_add(peer, STAT_TX_ERROR, stat_size);
+			fastd_stats_add(priv->peer, STAT_TX_ERROR, priv->stat_size);
 		}
 	} else {
-		fastd_stats_add(peer, STAT_TX, stat_size);
+		fastd_stats_add(priv->peer, STAT_TX, priv->stat_size);
 	}
 
-	fastd_buffer_free(buffer);
+	fastd_buffer_free(priv->buffer);
+
+#ifdef HAVE_LIBURING
+	free(priv);
+#endif
 }
 
 /** Sends a payload packet */

@@ -68,6 +68,8 @@ typedef enum fastd_poll_type {
 	POLL_TYPE_SOCKET,     /**< A network socket */
 } fastd_poll_type_t;
 
+
+
 /** Task types */
 typedef enum fastd_task_type {
 	TASK_TYPE_UNSPEC = 0,  /**< Unspecified task type */

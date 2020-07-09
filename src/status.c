@@ -259,7 +259,11 @@ void fastd_status_init(void) {
 		pr_debug_errno("setegid");
 #endif
 
+#ifdef HAVE_LIBURING
+	ctx.func_fd_register(&ctx.status_fd);
+#else
 	fastd_poll_fd_register(&ctx.status_fd);
+#endif
 }
 
 /** Closes the status socket */
@@ -275,9 +279,22 @@ void fastd_status_close(void) {
 	ctx.status_fd.fd = -1;
 }
 
+#ifdef HAVE_LIBURING
+/* forward declaration */
+void fastd_status_handle_callback(int fd, void *p);
+#endif
+
 /** Handles a single connection on the status socket */
 void fastd_status_handle(void) {
+#ifndef HAVE_LIBURING
 	int fd = accept(ctx.status_fd.fd, NULL, NULL);
+
+#else
+	ctx.func_accept(&ctx.status_fd, NULL, NULL, NULL, fastd_status_handle_callback);
+}
+
+void fastd_status_handle_callback(int fd, void *p) {
+#endif
 
 	if (fd < 0) {
 		pr_warn_errno("fastd_status_handle: accept");
@@ -286,5 +303,4 @@ void fastd_status_handle(void) {
 
 	dump_status(fd);
 }
-
 #endif

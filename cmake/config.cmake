@@ -44,8 +44,10 @@ set(ENABLE_LTO FALSE CACHE BOOL "Enable link-time optimization")
 
 if(LINUX AND NOT ANDROID)
   set(ENABLE_SYSTEMD TRUE CACHE BOOL "Enable systemd support")
+  set(ENABLE_LIBURING TRUE CACHE BOOL "Enable io_uring support")
 else(LINUX AND NOT ANDROID)
   set(ENABLE_SYSTEMD FALSE)
+  set(ENABLE_LIBURING FALSE)
 endif(LINUX AND NOT ANDROID)
 
 if(USE_USER)

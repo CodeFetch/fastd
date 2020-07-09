@@ -90,6 +90,9 @@
 /** Defined if libsodium is used */
 #cmakedefine HAVE_LIBSODIUM
 
+/** Defined if liburing is used */
+#cmakedefine HAVE_LIBURING
+
 
 /** The maximum depth of nested includes in config files */
 #define MAX_CONFIG_DEPTH @MAX_CONFIG_DEPTH_NUM@

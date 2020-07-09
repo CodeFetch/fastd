@@ -395,28 +395,59 @@ static void cleanup_iface(UNUSED fastd_iface_t *iface) {}
 
 #endif
 
+struct iface_priv {
+	fastd_iface_t *iface;
+	fastd_buffer_t buffer;
+};
+
+#ifdef HAVE_LIBURING
+/* forward declaration */
+void fastd_iface_handle_callback(ssize_t len, void *p);
+#endif
 
 /** Reads a packet from the TUN/TAP device */
 void fastd_iface_handle(fastd_iface_t *iface) {
+#ifdef HAVE_LIBURING
+	struct iface_priv *priv = fastd_new_aligned(struct iface_priv, 16);
+#else
+	uint8_t tmp_priv[sizeof(struct iface_priv)] __attribute__((aligned(8))) = {};
+	struct iface_priv *priv = tmp_priv;
+#endif
 	size_t max_len = fastd_max_payload(iface->mtu);
 
-	fastd_buffer_t buffer;
 	if (multiaf_tun && get_iface_type() == IFACE_TYPE_TUN)
-		buffer = fastd_buffer_alloc(max_len + 4, conf.min_encrypt_head_space + 12, conf.min_encrypt_tail_space);
+		priv->buffer = fastd_buffer_alloc(max_len + 4, conf.min_encrypt_head_space + 12, conf.min_encrypt_tail_space);
 	else
-		buffer = fastd_buffer_alloc(max_len, conf.min_encrypt_head_space, conf.min_encrypt_tail_space);
+		priv->buffer = fastd_buffer_alloc(max_len, conf.min_encrypt_head_space, conf.min_encrypt_tail_space);
 
+#ifndef HAVE_LIBURING
 	ssize_t len = read(iface->fd.fd, buffer.data, max_len);
+#else
+	ctx.func_read(&iface->fd, priv->buffer.data, max_len, priv, fastd_iface_handle_callback);
+}
+
+void fastd_iface_handle_callback(ssize_t len, void *p) {
+	struct iface_priv *priv = p;
+#endif
 	if (len < 0)
 		exit_errno("read");
 
-	buffer.len = len;
+	priv->buffer.len = len;
 
 	if (multiaf_tun && get_iface_type() == IFACE_TYPE_TUN)
-		fastd_buffer_push_head(&buffer, 4);
+		fastd_buffer_push_head(&priv->buffer, 4);
 
-	fastd_send_data(buffer, NULL, iface->peer);
+	fastd_send_data(priv->buffer, NULL, priv->iface->peer);
+
+#ifdef HAVE_LIBURING
+	free(priv);
+#endif
 }
+
+#ifdef HAVE_LIBURING
+/* forward declaration */
+void fastd_iface_write_callback(ssize_t ret, void *p);
+#endif
 
 /** Writes a packet to the TUN/TAP device */
 void fastd_iface_write(fastd_iface_t *iface, fastd_buffer_t buffer) {
@@ -447,8 +478,18 @@ void fastd_iface_write(fastd_iface_t *iface, fastd_buffer_t buffer) {
 		memcpy(buffer.data, &af, 4);
 	}
 
+#ifndef HAVE_LIBURING
 	if (write(iface->fd.fd, buffer.data, buffer.len) < 0)
 		pr_debug2_errno("write");
+
+#else
+	ctx.func_write(&iface->fd, buffer.data, buffer.len, NULL, fastd_iface_write_callback);
+}
+
+void fastd_iface_write_callback(ssize_t ret, void *p) {
+	if (ret < 0)
+		pr_debug2_errno("write");
+#endif
 }
 
 /** Opens a new TUN/TAP interface, optionally associated with a specific peer */
@@ -525,7 +566,11 @@ fastd_iface_t *fastd_iface_open(fastd_peer_t *peer) {
 	else
 		pr_debug("TUN/TAP device initialized.");
 
+#ifdef HAVE_LIBURING
+	ctx.func_fd_register(&iface->fd);
+#else
 	fastd_poll_fd_register(&iface->fd);
+#endif
 
 	return iface;
 }

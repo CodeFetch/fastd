@@ -23,6 +23,7 @@
 #include "peer_group.h"
 #include "peer_hashtable.h"
 #include "poll.h"
+#include "uring.h"
 #include <generated/version.h>
 
 #include <grp.h>
@@ -484,7 +485,11 @@ static inline void init(int argc, char *argv[]) {
 
 	fastd_cap_acquire();
 
+#ifdef HAVE_LIBURING
+	fastd_uring_init();
+#else
 	fastd_poll_init();
+#endif
 
 	init_sockets();
 
