@@ -48,6 +48,7 @@ static inline int task_timeout(void) {
 
 /** Handles a file descriptor that was selected on */
 static inline void handle_fd(fastd_poll_fd_t *fd, bool input, bool error) {
+	pr_debug("handle_fd() called %i vs %i", POLL_TYPE_URING, fd->type);
 	switch (fd->type) {
 	case POLL_TYPE_ASYNC:
 		if (input)
@@ -86,8 +87,14 @@ static inline void handle_fd(fastd_poll_fd_t *fd, bool input, bool error) {
 		break;
 	}
 
+	case POLL_TYPE_URING: {
+		fastd_uring_handle();
+		break;
+	}
+
 	default:
-		exit_bug("unknown FD type");
+		pr_debug("poll");
+		pr_debug("unknown FD type %i", fd->type);
 	}
 
 	if (error)
@@ -110,6 +117,7 @@ static inline int epoll_wait_unblocked(int epfd, struct epoll_event *events, int
 
 
 void fastd_poll_init(void) {
+	pr_debug("POLLINIT\n");
 	ctx.epoll_fd = epoll_create(1);
 	if (ctx.epoll_fd < 0)
 		exit_errno("epoll_create1");
@@ -122,6 +130,7 @@ void fastd_poll_free(void) {
 
 
 void fastd_poll_fd_register(fastd_poll_fd_t *fd) {
+	pr_debug("POLLREGISTER\n");
 	if (fd->fd < 0)
 		exit_bug("fastd_poll_fd_register: invalid FD");
 

@@ -1,3 +1,8 @@
 *~
 /doc/build
 /android
+**.a
+src/fastd
+**/Makefile
+**/CMakeFiles
+**/cmake_install.cmake

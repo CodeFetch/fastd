@@ -1,5 +1,5 @@
 set_property(DIRECTORY PROPERTY COMPILE_DEFINITIONS _GNU_SOURCE __APPLE_USE_RFC_3542)
-set(FASTD_CFLAGS "${PTHREAD_CFLAGS} -std=c99 ${LIBUECC_CFLAGS_OTHER} ${LIBNACL_CFLAGS_OTHER} ${JSON_C_CFLAGS_OTHER} ${CFLAGS_LTO} -Wall")
+set(FASTD_CFLAGS "${PTHREAD_CFLAGS} -std=c99 ${LIBUECC_CFLAGS_OTHER} ${LIBNACL_CFLAGS_OTHER} ${JSON_C_CFLAGS_OTHER} ${CFLAGS_LTO} -fno-omit-frame-pointer -Wall")
 
 include_directories(${FASTD_SOURCE_DIR} ${FASTD_BINARY_DIR}/gen)
 
@@ -44,12 +44,13 @@ add_executable(fastd
   time.c
   vector.c
   verify.c
+  uring.c
   ${BISON_fastd_config_parse_OUTPUTS}
 )
 set_property(TARGET fastd PROPERTY COMPILE_FLAGS "${FASTD_CFLAGS}")
 set_property(TARGET fastd PROPERTY LINK_FLAGS "${PTHREAD_LDFLAGS} ${LIBUECC_LDFLAGS_OTHER} ${NACL_LDFLAGS_OTHER} ${JSON_C_LDFLAGS_OTHER} ${LDFLAGS_LTO}")
 set_property(TARGET fastd APPEND PROPERTY INCLUDE_DIRECTORIES ${LIBCAP_INCLUDE_DIR} ${NACL_INCLUDE_DIRS} ${JSON_C_INCLUDE_DIR})
-target_link_libraries(fastd protocols methods ciphers macs ${RT_LIBRARY} ${LIBCAP_LIBRARY} ${LIBUECC_LIBRARIES} ${NACL_LIBRARIES} ${JSON_C_LIBRARIES})
+target_link_libraries(fastd protocols methods ciphers macs ${RT_LIBRARY} ${LIBCAP_LIBRARY} ${LIBUECC_LIBRARIES} ${NACL_LIBRARIES} ${JSON_C_LIBRARIES} ${LIBURING_LIBRARIES})
 
 add_dependencies(fastd version)
 

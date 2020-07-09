@@ -81,3 +81,12 @@ void fastd_logf(const fastd_loglevel_t level, const char *format, ...);
 	} while (0)
 /** Logs a simple error message adding the error found in \e errno and exits with an error status */
 #define exit_errno(message) exit_error("%s: %s", message, strerror(errno))
+
+
+
+#define URING_DEBUG		0
+#if (URING_DEBUG >= 1)
+	#define uring_debug(args...) fastd_logf(LL_DEBUG, args)
+#else
+	#define uring_debug(args...) do {} while (0)
+#endif

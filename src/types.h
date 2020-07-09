@@ -66,7 +66,21 @@ typedef enum fastd_poll_type {
 	POLL_TYPE_STATUS,     /**< The status socket */
 	POLL_TYPE_IFACE,      /**< A TUN/TAP interface */
 	POLL_TYPE_SOCKET,     /**< A network socket */
+	POLL_TYPE_URING,     /**< An io_uring eventfd */
 } fastd_poll_type_t;
+
+typedef enum uring_sched_op {
+	URING_OP_SENDMSG,
+	URING_OP_WRITE,
+	URING_OP_RECVMSG,
+	URING_OP_READ,
+	URING_OP_MAX_COUNT
+} uring_sched_op_t;
+
+typedef enum fastd_uring_action {
+	URING_INPUT,
+	URING_OUTPUT,
+} fastd_uring_action_t;
 
 /** Task types */
 typedef enum fastd_task_type {
@@ -143,3 +157,9 @@ typedef struct fastd_method_session_state fastd_method_session_state_t;
 
 typedef struct fastd_cipher_state fastd_cipher_state_t;
 typedef struct fastd_mac_state fastd_mac_state_t;
+
+typedef struct fastd_buffer fastd_buffer_t;
+
+
+typedef struct uring_schedule uring_sched_t;
+typedef struct uring_schedule_queue uring_sched_queue_t;

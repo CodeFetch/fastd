@@ -59,6 +59,10 @@ static void print_usage(const char *options, const char *message) {
 static void usage(void) {
 	puts("fastd (Fast and Secure Tunnelling Daemon) " FASTD_VERSION " usage:\n");
 
+#ifdef HAVE_LIBURING
+	puts("PATCHED with liburing\n");
+#endif
+
 #define OR ", "
 #define SEPARATOR puts("")
 #define OPTION(func, options, message) print_usage("  " options, message)

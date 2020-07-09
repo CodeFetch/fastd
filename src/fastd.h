@@ -25,6 +25,7 @@
 #include "task.h"
 #include "util.h"
 #include "vector.h"
+#include "uring.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -37,6 +38,11 @@
 #include <string.h>
 #include <time.h>
 
+#ifdef HAVE_LIBURING
+#include <liburing.h>
+#endif
+
+#define MAX_URING_BACKLOG_SIZE 64
 
 /** An ethernet address */
 struct __attribute__((packed)) fastd_eth_addr {
@@ -299,6 +305,30 @@ struct fastd_context {
 	fastd_sem_t verify_limit; /**< Keeps track of the number of verifier threads */
 #endif
 
+#ifdef HAVE_LIBURING
+	struct io_uring_params uring_params;
+	struct io_uring uring;
+	bool uring_initialized;
+	int uring_fixed_file_fps[2048];	/* only contains the TUN/TAP iface fp, sock fp */
+	int uring_fixed_file_fps_cnt;
+	size_t uring_cqe_pos;
+	size_t uring_cqe_count;
+	unsigned uring_recvmsg_num;
+	unsigned uring_read_num;
+	size_t uring_output_pending;
+	bool uring_must_submit;
+	bool uring_sqe_must_link;
+	void (*func_accept)(fastd_poll_fd_t *, struct sockaddr *, socklen_t *, void *, void (*)(ssize_t, void *));
+	void (*func_recvmsg)(fastd_poll_fd_t *, struct msghdr *, int, void *, void (*)(ssize_t, void *));
+	void (*func_sendmsg)(fastd_poll_fd_t *, const struct msghdr *, int, void *, void (*)(ssize_t, void *));
+	void (*func_read)(fastd_poll_fd_t *, void *, size_t, void *, void (*)(ssize_t, void *));
+	void (*func_write)(fastd_poll_fd_t *, const void *, size_t, void *, void (*)(ssize_t, void *));
+	void (*func_fd_register)(fastd_poll_fd_t *);
+	bool (*func_fd_close)(fastd_poll_fd_t *);
+	void (*func_io_handle)(void);
+	void (*func_io_free)(void);
+	fastd_poll_fd_t uring_fd;
+#endif
 #ifdef USE_EPOLL
 	int epoll_fd; /**< The file descriptor for the epoll facility */
 #else

@@ -23,6 +23,7 @@
 #include "peer_group.h"
 #include "peer_hashtable.h"
 #include "poll.h"
+#include "uring.h"
 #include <generated/version.h>
 
 #include <grp.h>
@@ -484,7 +485,11 @@ static inline void init(int argc, char *argv[]) {
 
 	fastd_cap_acquire();
 
+#ifdef HAVE_LIBURING
+	fastd_uring_init();
+#else
 	fastd_poll_init();
+#endif
 
 	init_sockets();
 
@@ -584,10 +589,17 @@ static inline void handle_signals(void) {
 
 /** A single iteration of fastd's main loop */
 static inline void run(void) {
+
 	fastd_task_handle();
+
+#ifdef HAVE_LIBURING
+	ctx.func_io_handle();
+#else
 	fastd_poll_handle();
+#endif
 
 	handle_signals();
+
 }
 
 /** Removes all peers */
@@ -615,7 +627,11 @@ static inline void cleanup(void) {
 
 	fastd_status_close();
 	close_sockets();
+#ifdef HAVE_LIBURING
+	ctx.func_io_free();
+#else
 	fastd_poll_free();
+#endif
 
 	on_post_down();
 

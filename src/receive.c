@@ -145,11 +145,12 @@ static bool backoff_unknown(const fastd_peer_address_t *addr) {
 static inline void handle_socket_receive_known(
 	fastd_socket_t *sock, const fastd_peer_address_t *local_addr, const fastd_peer_address_t *remote_addr,
 	fastd_peer_t *peer, fastd_buffer_t buffer) {
+	uring_debug("handle_socket_receive_known");
 	if (!fastd_peer_may_connect(peer)) {
 		fastd_buffer_free(buffer);
 		return;
 	}
-
+	uring_debug("handle_socket_receive_known1");
 	const uint8_t *packet_type = buffer.data;
 	fastd_buffer_push_head(&buffer, 1);
 
@@ -164,11 +165,12 @@ static inline void handle_socket_receive_known(
 			}
 			return;
 		}
-
+		uring_debug("handle_socket_receive_known data");
 		conf.protocol->handle_recv(peer, buffer);
 		break;
 
 	case PACKET_HANDSHAKE:
+		uring_debug("handle_socket_receive_known handshakle");
 		fastd_handshake_handle(sock, local_addr, remote_addr, peer, buffer);
 	}
 }
@@ -196,6 +198,7 @@ static inline void handle_socket_receive_unknown(
 		break;
 
 	case PACKET_HANDSHAKE:
+		uring_debug("handle_socket_receive_unknown handshake");
 		fastd_handshake_handle(sock, local_addr, remote_addr, NULL, buffer);
 	}
 }
@@ -205,6 +208,8 @@ static inline void handle_socket_receive(
 	fastd_socket_t *sock, const fastd_peer_address_t *local_addr, const fastd_peer_address_t *remote_addr,
 	fastd_buffer_t buffer) {
 	fastd_peer_t *peer = NULL;
+
+	uring_debug("handle_socket_receive()");
 
 	if (sock->peer) {
 		if (!fastd_peer_address_equal(&sock->peer->address, remote_addr)) {
@@ -227,49 +232,101 @@ static inline void handle_socket_receive(
 	}
 }
 
-/** Reads a packet from a socket */
-void fastd_receive(fastd_socket_t *sock) {
-	size_t max_len = 1 + fastd_max_payload(ctx.max_mtu) + conf.max_overhead;
-	fastd_buffer_t buffer = fastd_buffer_alloc(max_len, conf.min_decrypt_head_space, conf.min_decrypt_tail_space);
+struct receive_priv {
+	uint8_t cbuf[1024];
+	fastd_socket_t *sock;
+	size_t max_len;
+	fastd_buffer_t buffer;
 	fastd_peer_address_t local_addr;
 	fastd_peer_address_t recvaddr;
-	struct iovec buffer_vec = { .iov_base = buffer.data, .iov_len = buffer.len };
-	uint8_t cbuf[1024] __attribute__((aligned(8)));
+	struct iovec buffer_vec;
+	struct msghdr message;
+};
 
-	struct msghdr message = {
-		.msg_name = &recvaddr,
-		.msg_namelen = sizeof(recvaddr),
-		.msg_iov = &buffer_vec,
-		.msg_iovlen = 1,
-		.msg_control = cbuf,
-		.msg_controllen = sizeof(cbuf),
-	};
+#ifdef HAVE_LIBURING
+/* forward declaration */
+void fastd_receive_callback(ssize_t len, void *p);
+#endif
 
+/** Reads a packet from a socket */
+void fastd_receive(fastd_socket_t *sock) {
+#ifdef HAVE_LIBURING
+	struct receive_priv *priv = fastd_new_aligned(struct receive_priv, 16);
+
+	memset(priv, 0, sizeof(struct receive_priv));
+#else
+	uint8_t tmp_priv[sizeof(struct receive_priv)] __attribute__((aligned(8)));
+	struct receive_priv *priv = &tmp_priv;
+#endif
+
+	priv->max_len = 1 + fastd_max_payload(ctx.max_mtu) + conf.max_overhead;
+	priv->buffer = fastd_buffer_alloc(priv->max_len, conf.min_decrypt_head_space, conf.min_decrypt_tail_space);
+	priv->buffer_vec.iov_base = priv->buffer.data;
+	priv->buffer_vec.iov_len = priv->buffer.len;
+	priv->sock = sock;
+
+	priv->message.msg_name = &priv->recvaddr;
+	priv->message.msg_namelen = sizeof(priv->recvaddr);
+	priv->message.msg_iov = &priv->buffer_vec;
+	priv->message.msg_iovlen = 1;
+	/*
+	priv->message.msg_control = priv->cbuf;
+	priv->message.msg_controllen = sizeof(priv->cbuf);*/
+
+
+#ifndef HAVE_LIBURING
 	ssize_t len = recvmsg(sock->fd.fd, &message, 0);
-	if (len <= 0) {
-		if (len < 0)
-			pr_warn_errno("recvmsg");
+#else
+	ctx.func_recvmsg(&sock->fd, &priv->message, 0, priv, fastd_receive_callback);
+}
 
-		fastd_buffer_free(buffer);
-		return;
+void fastd_receive_callback(ssize_t len, void *p) {
+	struct receive_priv *priv = p;
+#endif
+	if (len <= 0) {
+		/*
+		if (len < 0)
+			pr_warn_errno("recvmsg");*/
+
+		/* Done in uring.c 
+		if (priv->sock->peer) {
+			fastd_peer_reset_socket(priv->sock->peer);
+		} else {
+			fastd_socket_error(priv->sock);
+		}*/
+
+		fastd_buffer_free(priv->buffer);
+		goto out;
 	}
 
-	buffer.len = len;
-
-	handle_socket_control(&message, sock, &local_addr);
+	priv->buffer.len = len;
+	handle_socket_control(&priv->message, priv->sock, &priv->local_addr);
 
 #ifdef USE_PKTINFO
-	if (!local_addr.sa.sa_family) {
+	if (!priv->local_addr.sa.sa_family) {
 		pr_error("received packet without packet info");
-		fastd_buffer_free(buffer);
-		return;
+		fastd_buffer_free(priv->buffer);
+		goto out;
 	}
 #endif
 
-	fastd_peer_address_simplify(&local_addr);
-	fastd_peer_address_simplify(&recvaddr);
+	fastd_peer_address_simplify(&priv->local_addr);
+	fastd_peer_address_simplify(&priv->recvaddr);
 
-	handle_socket_receive(sock, &local_addr, &recvaddr, buffer);
+	uring_debug("fastd_receive_callback received %i bytes", priv->buffer.len);
+	/*
+	char test_str[10];
+	memcpy(test_str, priv->buffer.data, 10);
+	test_str[0] = 'h';
+	test_str[10] = '\0';
+	pr_debug("fastd first bytes %s", test_str);*/
+
+	handle_socket_receive(priv->sock, &priv->local_addr, &priv->recvaddr, priv->buffer);
+
+out:
+#ifdef HAVE_LIBURING
+	free(priv);
+#endif
 }
 
 /** Handles a received and decrypted payload packet */

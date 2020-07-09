@@ -221,7 +221,6 @@ void fastd_status_init(void) {
 	if (ctx.status_fd.fd < 0)
 		exit_errno("fastd_status_init: socket");
 
-
 	size_t status_socket_len = strlen(conf.status_socket);
 	size_t len = offsetof(struct sockaddr_un, sun_path) + status_socket_len + 1;
 	uint8_t buf[len] __attribute__((aligned(__alignof__(struct sockaddr_un))));
@@ -259,7 +258,11 @@ void fastd_status_init(void) {
 		pr_debug_errno("setegid");
 #endif
 
+#ifdef HAVE_LIBURING
+	ctx.func_fd_register(&ctx.status_fd);
+#else
 	fastd_poll_fd_register(&ctx.status_fd);
+#endif
 }
 
 /** Closes the status socket */
@@ -267,7 +270,11 @@ void fastd_status_close(void) {
 	if (!conf.status_socket || ctx.status_fd.fd < 0)
 		return;
 
+#ifdef HAVE_LIBURING
+	if (!ctx.func_fd_close(&ctx.status_fd))
+#else
 	if (!fastd_poll_fd_close(&ctx.status_fd))
+#endif
 		pr_warn_errno("fastd_status_cleanup: close");
 
 	unlink_status_socket();
@@ -286,5 +293,4 @@ void fastd_status_handle(void) {
 
 	dump_status(fd);
 }
-
 #endif

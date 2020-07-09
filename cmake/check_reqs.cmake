@@ -20,3 +20,8 @@ else(${nacl_required})
   set(NACL_LIBRARIES "")
   set(NACL_LDFLAGS_OTHER "")
 endif(${nacl_required})
+
+set(HAVE_LIBURING FALSE)
+if(ENABLE_LIBURING)
+    set(HAVE_LIBURING TRUE)
+endif(ENABLE_LIBURING)
