@@ -25,6 +25,21 @@ struct fastd_buffer {
 	size_t len; /**< The data length */
 };
 
+struct fastd_buffer_group_entry {
+	fastd_buffer_t buf;
+	fastd_buffer_group_id_t gid;
+	size_t bid;
+	struct fastd_buffer_group_entry *next;
+}
+
+struct fastd_buffer_group {
+	unsigned count; /**< The number of buffers contained */
+	size_t len; /**< The size of a single allocated memory area */
+	size_t head_space;
+	struct fastd_buffer_group_entry *head;
+	struct fastd_buffer_group_entry *tail;
+	struct fastd_buffer_group_entry[] *entries;
+}
 
 /**
    Allocate a new buffer
@@ -89,4 +104,28 @@ static inline void fastd_buffer_push_head(fastd_buffer_t *buffer, size_t len) {
 static inline void fastd_buffer_push_head_to(fastd_buffer_t *buffer, void *data, size_t len) {
 	memcpy(data, buffer->data, len);
 	fastd_buffer_push_head(buffer, len);
+}
+
+void fastd_buffer_group_init(int gid, unsigned count, const size_t len, size_t head_space, size_t tail_space);
+
+/** Acquires an unused buffer from a buffer group */
+static inline fastd_buffer_group_entry *fastd_buffer_group_entry_acquire(int gid) {
+	struct fastd_buffer_group_entry *entry = ctx.buffers[gid].head;
+	
+	if (!entry)
+		exit_bug("buffer_acquire");
+
+	ctx.buffers[gid].head = entry->next;
+	
+	entry->buf->data = entry->buf->base + ctx.buffers[gid].head_space;
+	entry->buf->len = ctx.buffers[gid].len;
+
+	return entry;
+}
+
+/** Releases a buffer to a buffer group */
+static inline void fastd_buffer_release(fastd_buffer_t *buf) {
+	struct fastd_buffer_group_entry *entry = container_of(buf, struct fastd_buffer_group_entry, fd);
+	entry->next = NULL;
+	ctx.buffers[entry->gid].tail->next = entry;
 }

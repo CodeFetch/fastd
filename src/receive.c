@@ -247,7 +247,7 @@ void fastd_receive_callback(ssize_t len, void *p);
 void fastd_receive(fastd_socket_t *sock) {
 #ifdef HAVE_LIBURING
 	struct receive_priv *priv = fastd_new_aligned(struct receive_priv, 16);
-	
+
 	memset(priv, 0, sizeof(struct receive_priv));
 #else
 	uint8_t tmp_priv[sizeof(struct receive_priv)] __attribute__((aligned(8)));
@@ -281,7 +281,7 @@ void fastd_receive_callback(ssize_t len, void *p) {
 	if (len <= 0) {
 		if (len < 0)
 			pr_warn_errno("recvmsg");
-		pr_debug("fastd_receive_callback err %i", priv->sock->fd.fd);
+		pr_debug("fastd_receive_callback err fd=%i", priv->sock->fd.fd);
 
 		/* Done in uring.c
 		if (priv->sock->peer) {
@@ -290,6 +290,7 @@ void fastd_receive_callback(ssize_t len, void *p) {
 			fastd_socket_error(priv->sock);
 		}*/
 		pr_debug("fastd_receive_callback out");
+		fastd_buffer_free(priv->buffer);
 		goto out;
 	}
 
@@ -300,6 +301,7 @@ void fastd_receive_callback(ssize_t len, void *p) {
 #ifdef USE_PKTINFO
 	if (!priv->local_addr.sa.sa_family) {
 		pr_error("received packet without packet info");
+		fastd_buffer_free(priv->buffer);
 		goto out;
 	}
 #endif
@@ -307,11 +309,17 @@ void fastd_receive_callback(ssize_t len, void *p) {
 	fastd_peer_address_simplify(&priv->local_addr);
 	fastd_peer_address_simplify(&priv->recvaddr);
 
+	pr_debug("fastd_receive_callback received %i bytes", priv->buffer.len);
+	char test_str[10];
+	memcpy(test_str, priv->buffer.data, 10);
+	test_str[0] = 'h';
+	test_str[10] = '\0';
+	pr_debug("fastd first bytes %s", test_str);
+
 	handle_socket_receive(priv->sock, &priv->local_addr, &priv->recvaddr, priv->buffer);
 
 out:
 #ifdef HAVE_LIBURING
-	fastd_buffer_free(priv->buffer);
 	pr_debug("fastd_receive_callback free1");
 	free(priv);
 	pr_debug("fastd_receive_callback free2");

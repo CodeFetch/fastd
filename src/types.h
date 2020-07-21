@@ -69,7 +69,13 @@ typedef enum fastd_poll_type {
 	POLL_TYPE_URING,     /**< An io_uring eventfd */
 } fastd_poll_type_t;
 
-
+typedef enum fastd_buffer_group_id {
+	BUFFER_GROUP_UNSPEC,
+	BUFFER_GROUP_URING,
+	BUFFER_GROUP_IFACE,
+	BUFFER_GROUP_SOCKET,
+	BUFFER_GROUP_MAX
+} fastd_buffer_group_id_t
 
 /** Task types */
 typedef enum fastd_task_type {
