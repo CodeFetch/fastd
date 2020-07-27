@@ -21,6 +21,7 @@
  ***/
 
 #include <sys/eventfd.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 #include <liburing.h>
 #include "uring.h"
@@ -31,12 +32,37 @@
 #define MAX_URING_SIZE 256		/**/
 #define FASTD_URING_TIMEOUT	((__u64) -1234)
 
-#define URING_RECVMSG_NUM	32	/**/
-#define URING_READ_NUM		32	/**/
+#define URING_RECVMSG_NUM	1	/**/
+#define URING_READ_NUM		1	/**/
+#define SYSCALL_IO_URING_ENTER	536
 
 bool mustsubmit;
 int uring_read_flags;
 int uring_recvmsg_flags;
+
+/* we count the number of sent/write submissions pending,
+ * because we expect these operations to always succeed and
+ * don't want to be woken up then. */
+int uring_output_cnt;
+struct fastd_uring_priv *uring_sendmsg_queue_head, *uring_sendmsg_queue_tail;
+struct fastd_uring_priv *uring_write_queue_head, *uring_write_queue_tail;
+
+#define uring_schedule_add(priv, head, tail) { \
+		if (!tail) { \
+			tail = priv; \
+		} else { \
+			head->next = priv; \
+		} \
+		head = priv; \
+	}
+
+int uring_enter(int fd, unsigned to_submit, unsigned min_complete, unsigned flags, sigset_t *sig) {
+	
+}
+
+static int uring_wait_cqe_nr(int count) {
+	return syscall(SYSCALL_IO_URING_ENTER, ctx.uring.ring_fd, 0, count, IORING_ENTER_GETEVENTS, NULL, _NSIG / 8);
+}
 
 /** Returns the time to the next task or -1 */
 static inline int task_timeout(void) {
@@ -77,6 +103,8 @@ static int uring_submit(void) {
 	if(ret == 0) {
 		exit_bug("submit without CQEs");
 	}
+	
+	mustsubmit = false;
 
 	return ret;
 }
@@ -104,11 +132,6 @@ static inline void uring_submit_priv(struct io_uring_sqe *sqe, struct fastd_urin
 
 	pr_debug("setting data pointer %p\n", priv);
 	io_uring_sqe_set_data(sqe, priv);
-
-	if(mustsubmit) {
-		mustsubmit = false;
-		uring_submit();
-	}
 }
 
 static inline struct io_uring_sqe *uring_get_sqe() {
@@ -167,7 +190,6 @@ void fastd_uring_accept(fastd_poll_fd_t *fd, struct sockaddr *addr, socklen_t *a
 	struct fastd_uring_priv *priv = uring_priv_new(fd, URING_INPUT, data, cb);
 
 	io_uring_prep_accept(sqe, fd->uring_idx, addr, addrlen, 0);
-	mustsubmit = true;
 	uring_submit_priv(sqe, priv, IOSQE_FIXED_FILE);
 }
 
@@ -193,13 +215,12 @@ void fastd_uring_sendmsg_unsupported(fastd_poll_fd_t *fd, const struct msghdr *m
 }
 
 void fastd_uring_sendmsg(fastd_poll_fd_t *fd, const struct msghdr *msg, int flags, void *data, void (*cb)(ssize_t, void *)) {
-	struct io_uring_sqe *sqe = uring_get_sqe();
 	struct fastd_uring_priv *priv = uring_priv_new(fd, URING_OUTPUT, data, cb);
+	pr_debug("preparing a SENDMSG");
+	priv->sendmsg_msg = msg;
+	priv->sendmsg_flags = flags;
 
-	io_uring_prep_sendmsg(sqe, fd->uring_idx, msg, flags);
-	//io_uring_sqe_set_flags(sqe, IOSQE_ASYNC); used for blocking devices
-	mustsubmit = true;
-	uring_submit_priv(sqe, priv, IOSQE_FIXED_FILE);
+	uring_schedule_add(priv, uring_sendmsg_queue_head, uring_sendmsg_queue_tail);
 }
 
 /** Used when the kernel doesn't support io_uring */
@@ -221,27 +242,76 @@ void fastd_uring_write_unsupported(fastd_poll_fd_t *fd, const void *buf, size_t 
 }
 
 void fastd_uring_write(fastd_poll_fd_t *fd, const void *buf, size_t count, void *data, void (*cb)(ssize_t, void *)) {
-	struct io_uring_sqe *sqe = uring_get_sqe();
 	struct fastd_uring_priv *priv = uring_priv_new(fd, URING_OUTPUT, data, cb);
-	mustsubmit = true;
-	io_uring_prep_write(sqe, fd->uring_idx, buf, count, 0);
-	uring_submit_priv(sqe, priv, IOSQE_FIXED_FILE);
+
+	priv->write_buf = buf;
+	priv->write_count = count;
+
+	uring_schedule_add(priv, uring_write_queue_head, uring_write_queue_tail);
 }
 
 void uring_poll_add(fastd_poll_fd_t *fd, short poll_mask) {
 	struct io_uring_sqe *sqe = uring_get_sqe();
-	mustsubmit = true;
+
 	io_uring_prep_poll_add(sqe, fd->fd, poll_mask);
 	uring_submit_priv(sqe, (struct fastd_uring_priv *)&fd, 0);
 }
 
 void uring_poll_remove(fastd_poll_fd_t *fd) {
 	struct io_uring_sqe *sqe = uring_get_sqe();
-	mustsubmit = true;
+
 	io_uring_prep_poll_remove(sqe, &fd);
 	uring_submit_priv(sqe, (struct fastd_uring_priv *)&fd, 0);
 }
 
+/* FIXME Do per-fd queues */
+static void uring_sendmsg_execute(void) {
+	struct fastd_uring_priv *priv;
+	struct io_uring_sqe *sqe;
+
+	ctx.uring_sqe_must_link = true;
+	for(priv = uring_sendmsg_queue_tail; priv; priv = priv->next) {
+		mustsubmit = true;
+		sqe = uring_get_sqe();
+		pr_debug("submitting a SENDMSG");
+		io_uring_prep_sendmsg(sqe, priv->fd->uring_idx, priv->sendmsg_msg, priv->sendmsg_flags);
+		
+		if (priv == uring_sendmsg_queue_head) {
+			/* the first SQE without a link marks the end of the chain */
+			ctx.uring_sqe_must_link = false;
+		}
+		
+		uring_submit_priv(sqe, priv, IOSQE_FIXED_FILE);
+		uring_output_cnt++;
+	}
+
+	uring_sendmsg_queue_tail = NULL;
+	uring_sendmsg_queue_head = NULL;
+}
+
+static void uring_write_execute(void) {
+	struct fastd_uring_priv *priv;
+	struct io_uring_sqe *sqe;
+
+	ctx.uring_sqe_must_link = true;
+	for(priv = uring_write_queue_tail; priv; priv = priv->next) {
+		mustsubmit = true;
+		sqe = uring_get_sqe();
+
+		io_uring_prep_write(sqe, priv->fd->uring_idx, priv->write_buf, priv->write_count, 0);
+		
+		if (priv == uring_write_queue_head) {
+			/* the first SQE without a link marks the end of the chain */
+			ctx.uring_sqe_must_link = false;
+		}
+
+		uring_submit_priv(sqe, priv, IOSQE_FIXED_FILE);
+		uring_output_cnt++;
+	}
+
+	uring_write_queue_tail = NULL;
+	uring_write_queue_head = NULL;
+}
 
 static const char *op_strs[] = {
         "IORING_OP_NOP",
@@ -396,11 +466,14 @@ static inline void uring_cqe_handle(struct io_uring_cqe *cqe) {
 		pr_debug("output\n");
 	}
 
+	pr_debug("uring calling callback\n");
 	priv->caller_func(cqe->res, priv->caller_priv);
 	pr_debug("uring callback called\n");
 	
-	if (priv->action == URING_OUTPUT)
+	if (priv->action == URING_OUTPUT) {
+		uring_output_cnt--;
 		goto free;
+	}
 
 	if (cqe->res < 0) {
 		pr_debug("CQE failed %s\n", strerror(-cqe->res));
@@ -478,7 +551,7 @@ bool fastd_uring_fd_close(fastd_poll_fd_t *fd) {
 	return (close(fd->fd) == 0);
 }
 
-static inline void uring_submit_timeout_add(int timeout) {
+static inline void uring_timeout_add(int timeout) {
 	struct io_uring_sqe *sqe = uring_get_sqe();
 	struct __kernel_timespec ts = {
 			.tv_sec = timeout / 1000,
@@ -487,91 +560,93 @@ static inline void uring_submit_timeout_add(int timeout) {
 
 	io_uring_prep_timeout(sqe, &ts, 0, 0);
 	sqe->user_data = FASTD_URING_TIMEOUT;
-
-	uring_submit();
+	mustsubmit = true;
 }
 
-static inline void uring_submit_timeout_remove() {
+static inline void uring_timeout_remove() {
 	pr_debug("uring_submit_timeout_remove()");
 	struct io_uring_sqe *sqe = uring_get_sqe();
 
 	io_uring_prep_timeout_remove(sqe, FASTD_URING_TIMEOUT, 0);
-
-	uring_submit();
-}
-
-void fastd_uring_eventfd() {
-	ctx.uring_fd = FASTD_POLL_FD(POLL_TYPE_URING, eventfd(0, 0));
-	if (ctx.uring_fd.fd < 0)
-		exit_bug("eventfd");
-}
-
-void fastd_uring_eventfd_read() {
-	eventfd_t v;
-	int ret = eventfd_read(ctx.uring_fd.fd, &v);
-	pr_debug("eventfd_read result=%i", ret);
-	if (ret < 0) exit_bug("eventfd_read");
 }
 
 void fastd_uring_handle(void) {
+	pr_debug("fastd_uring_handle() called");
 	struct io_uring_cqe *cqe;
 	struct io_uring_cqe *cqes[MAX_URING_SIZE / 2];
-	int timeout = task_timeout();
-	unsigned head, count = 0, count_total = 0;
+	int ret, timeout = task_timeout();
+	unsigned head, ready, count = 0, count_total = 0;
 	bool has_timeout = false;
 
-	pr_debug("fastd_uring_handle() called");
-	pr_debug("time remaining %i count %i", timeout, count);
+	pr_debug("time remaining %i", timeout);
 
-	//fastd_uring_eventfd_read();
-        uring_submit_timeout_add(timeout);
-	while(1) {
-
-		int ret = io_uring_wait_cqe(&ctx.uring, &cqe);
-
-		if (ret != 0) {
-		    pr_debug("io_uring_wait_cqe\n");
-		    exit_bug("io_uring_wait_cqe");
+        uring_timeout_add(timeout);
+	while(!has_timeout) {
+		if(mustsubmit)
+			uring_submit();
+		/* sendmsgs and writes should always be submitted separately to not block following accesses */
+		uring_sendmsg_execute();
+		uring_write_execute();
+		/* by waiting for uring_output_cnt + 1 completions we make sure we don't wake up because of writes */
+		if (mustsubmit) {
+			pr_debug("submit_wait");
+			ret = io_uring_submit_and_wait(&ctx.uring, uring_output_cnt + 1);
+			pr_debug("submitted %i SQEs", ret);
+			mustsubmit = false;
+			if (ret < 1)
+				exit_bug("submit_without_entry");
 		}
 
-		count++;
-		
-		if (cqe->user_data == FASTD_URING_TIMEOUT) {
-			pr_debug("timeout");
-			has_timeout = true;
-			io_uring_cqe_seen(&ctx.uring, cqe);
-			break;
-		}
-		
-		if(cqe->user_data) {
-			uring_cqe_handle(cqe);
+		/* wait_cqe_nr always returns if a CQE is available */
+		ret = io_uring_wait_cqe_nr(&ctx.uring, &cqe, uring_output_cnt + 1);
+		ready = io_uring_cq_ready(&ctx.uring);
+		pr_debug("ready %i", ready);
+		count = 0;
+		while(count < ready) {
+			count++;
+			if (ret) {
+				pr_debug("enter syscall returned: %i", ret);
+				exit_bug("wait_cqe_nr");
+			}
+
+			if (cqe->user_data == FASTD_URING_TIMEOUT) {
+				pr_debug("timeout");
+				has_timeout = true;
+				io_uring_cqe_seen(&ctx.uring, cqe);
+				break;
+			}
+			
+			if(cqe->user_data) {
+				uring_cqe_handle(cqe);
+			}
+
+			/* Do not advance the CQE queue after every CQE as it is expensive.
+			 * To avoid dropping CQEs advance after at most MAX_URING_SIZE / 2 CQEs.
+			 */
+			if (count > MAX_URING_SIZE / 2) {
+				pr_debug("advancing cqe ring");
+				io_uring_cq_advance(&ctx.uring, count);
+				ready -= count;
+				count_total += count;
+				count = 0;
+			}
+
+			if(count != ready)
+				ret = io_uring_wait_cqe_nr(&ctx.uring, &cqe, uring_output_cnt + 1);
 		}
 
-		io_uring_cqe_seen(&ctx.uring, cqe);
-		/* Do not advance the CQE queue after every CQE as it is expensive.
-		 * To avoid dropping CQEs advance after at most MAX_URING_SIZE / 2 CQEs.
-		 */
-		/*if (count > MAX_URING_SIZE / 2) {
-			io_uring_cq_advance(&ctx.uring, count);
-			count_total += count;
-			count = 0;
-		}*/
+		io_uring_cq_advance(&ctx.uring, count);
+		count_total += count;
+	}
 
+	pr_debug("HANDLED %i CQEs", count_total);
+
+	if(!has_timeout) {
+		uring_timeout_remove();
+		uring_submit();
 	}
 	
 	fastd_update_time();
-	//count_total += count;
-	//io_uring_cq_advance(&ctx.uring, count);
-	//count = 0;
-	//fastd_uring_eventfd_read();
-
-	pr_debug("HANDLED %i CQEs", count);
-
-	if(!has_timeout) {
-		uring_submit_timeout_remove();
-	} else if(mustsubmit) {
-		uring_submit();
-	}
 
 	pr_debug("URING END");
 }
@@ -595,6 +670,7 @@ void fastd_uring_init(void) {
 	fastd_poll_init();
 	uring_recvmsg_flags = 0;
 	uring_read_flags = 0;
+	uring_output_cnt = 0;
 	ctx.func_recvmsg = fastd_uring_recvmsg;
 	ctx.func_sendmsg = fastd_uring_sendmsg;
 	ctx.func_read = fastd_uring_read;

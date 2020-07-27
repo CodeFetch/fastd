@@ -19,6 +19,11 @@ struct fastd_uring_priv {
 	fastd_uring_action_t action;
 	void (*caller_func)(ssize_t, void *);
 	void *caller_priv;
+	struct fastd_uring_priv *next;
+	struct msghdr *sendmsg_msg;
+	void *write_buf;
+	size_t write_count;
+	int sendmsg_flags;
 };
 
 void fastd_uring_preinit(void);
