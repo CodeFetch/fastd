@@ -313,6 +313,8 @@ struct fastd_context {
 	int uring_fixed_file_fps_cnt;
 	unsigned uring_recvmsg_num;
 	unsigned uring_read_num;
+	size_t uring_output_pending;
+	bool uring_must_submit;
 	bool uring_sqe_must_link;
 	void (*func_accept)(fastd_poll_fd_t *, struct sockaddr *, socklen_t *, void *, void (*)(ssize_t, void *));
 	void (*func_recvmsg)(fastd_poll_fd_t *, struct msghdr *, int, void *, void (*)(ssize_t, void *));

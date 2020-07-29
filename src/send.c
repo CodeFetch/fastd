@@ -70,8 +70,8 @@ struct send_priv {
 	fastd_buffer_t buffer;
 	uint8_t packet_type;
 	fastd_peer_t *peer;
+	fastd_poll_fd_t *fd;
 	fastd_peer_address_t remote_addr6;
-	fastd_poll_fd_t fd;
 	size_t stat_size;
 	struct iovec iov[2];
 	struct msghdr msg;
@@ -102,7 +102,7 @@ static void send_type(
 	priv->buffer = buffer;
 	priv->packet_type = packet_type;
 	priv->peer = peer;
-	memcpy(&priv->fd, &sock->fd, sizeof(priv->fd));
+	priv->fd = &sock->fd;
 	priv->stat_size = stat_size;
 
 	switch (remote_addr->sa.sa_family) {
@@ -151,7 +151,7 @@ static void send_type(
 	priv->msg.msg_control = NULL;
 	priv->msg.msg_controllen = 0;
 
-	ctx.func_sendmsg(&priv->fd, &priv->msg, 0, priv, fastd_send_callback_first);
+	ctx.func_sendmsg(priv->fd, &priv->msg, 0, priv, fastd_send_callback_first);
 }
 
 /* forward declaration */
@@ -174,7 +174,7 @@ void fastd_send_callback_first(ssize_t ret, void *p) {
 			priv->msg.msg_controllen = 0;
 
 #ifdef HAVE_LIBURING
-			ctx.func_sendmsg(&priv->fd, &priv->msg, 0, priv, fastd_send_callback_second);
+			ctx.func_sendmsg(priv->fd, &priv->msg, 0, priv, fastd_send_callback_second);
 #else
 			ret = sendmsg(priv->fd.fd, &priv->msg, 0);
 #endif

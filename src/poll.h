@@ -16,14 +16,34 @@
 
 #include "types.h"
 
+#ifdef HAVE_LIBURING
+struct uring_schedule {
+	uring_sched_op_t op;
+	struct msghdr *msg;
+	void *buf;
+	size_t count;
+	int flags;
+	struct uring_schedule *next;
+};
+
+struct uring_schedule_queue {
+	struct uring_schedule *head;
+	struct uring_schedule *tail;
+};
+#endif
 
 /** A file descriptor to poll on */
 struct fastd_poll_fd {
-	fastd_poll_type_t type; /**< What the file descriptor is used for */
-	int fd;                 /**< The file descriptor itself */
+	fastd_poll_type_t type;             /**< What the file descriptor is used for */
+	int fd;                             /**< The file descriptor itself */
 	int uring_idx;
+#ifdef HAVE_LIBURING
+	int input_pending;                  /**< The number of pending input requests */
+	int output_pending;                 /**< The number of pending output requests */
+	uring_sched_queue_t input_queue;    /**< The queues for scheduled IO */
+	uring_sched_queue_t output_queue;   /**< The queues for scheduled IO */
+#endif
 };
-
 
 /** Initializes the poll interface */
 void fastd_poll_init(void);

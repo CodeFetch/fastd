@@ -9,18 +9,6 @@
 #include "poll.h"
 #include "buffer.h"
 
-typedef enum fastd_poll_uring_type {
-	URING_INPUT,
-	URING_OUTPUT,
-} fastd_uring_action_t;
-
-struct fastd_uring_priv {
-	fastd_poll_fd_t *fd;
-	fastd_uring_action_t action;
-	void (*caller_func)(ssize_t, void *);
-	void *caller_priv;
-};
-
 void fastd_uring_preinit(void);
 void fastd_uring_init(void);
 void fastd_uring_free(void);
