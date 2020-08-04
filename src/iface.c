@@ -432,7 +432,7 @@ void fastd_iface_handle_callback(ssize_t len, void *p) {
 	struct iface_priv *priv = p;
 #endif
 	if (len < 0) {
-		pr_debug("read callback error");
+		uring_debug("read callback error");
 		goto free;
 		}
 

@@ -36,8 +36,8 @@ struct uring_schedule_queue {
 struct fastd_poll_fd {
 	fastd_poll_type_t type;             /**< What the file descriptor is used for */
 	int fd;                             /**< The file descriptor itself */
-	int uring_idx;
 #ifdef HAVE_LIBURING
+	int uring_idx;
 	int input_pending;                  /**< The number of pending input requests */
 	int output_pending;                 /**< The number of pending output requests */
 	uring_sched_queue_t input_queue;    /**< The queues for scheduled IO */

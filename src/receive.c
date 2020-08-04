@@ -284,11 +284,11 @@ void fastd_receive_callback(ssize_t len, void *p) {
 	struct receive_priv *priv = p;
 #endif
 	if (len <= 0) {
+		/*
 		if (len < 0)
-			pr_warn_errno("recvmsg");
-		pr_debug("fastd_receive_callback err fd=%i", priv->sock->fd.fd);
+			pr_warn_errno("recvmsg");*/
 
-		/* Done in uring.c
+		/* Done in uring.c 
 		if (priv->sock->peer) {
 			fastd_peer_reset_socket(priv->sock->peer);
 		} else {

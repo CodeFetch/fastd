@@ -311,6 +311,8 @@ struct fastd_context {
 	bool uring_initialized;
 	int uring_fixed_file_fps[2048];	/* only contains the TUN/TAP iface fp, sock fp */
 	int uring_fixed_file_fps_cnt;
+	size_t uring_cqe_pos;
+	size_t uring_cqe_count;
 	unsigned uring_recvmsg_num;
 	unsigned uring_read_num;
 	size_t uring_output_pending;

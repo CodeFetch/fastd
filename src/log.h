@@ -84,7 +84,7 @@ void fastd_logf(const fastd_loglevel_t level, const char *format, ...);
 
 
 
-#define URING_DEBUG		1
+#define URING_DEBUG		0
 #if (URING_DEBUG >= 1)
 	#define uring_debug(args...) fastd_logf(LL_DEBUG, args)
 #else

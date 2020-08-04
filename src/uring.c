@@ -21,6 +21,8 @@
  */
 
 #include <sys/eventfd.h>
+#include <sys/time.h>
+#include <signal.h>
 #include <unistd.h>
 #include <liburing.h>
 #include "uring.h"
@@ -29,13 +31,13 @@
 #include "fastd.h"
 
 
-#define URING_SQ_SIZE 		256			/* The number of entries the submission queue can hold */
+#define URING_SQ_SIZE 		512			/* The number of entries the submission queue can hold */
 #define URING_CQ_SIZE 		(URING_SQ_SIZE * 2)	/* The number of entries the completion queue can hold */
 #define URING_RECVMSG_NUM	64			/* The maximum number of recvmsg operations per socket */
 #define URING_READ_NUM		64			/* The maximum number of read operations per fd */
 
 #define FASTD_URING_TIMEOUT	((__u64) -1337)		/* Used as a magic value for marking a timeout CQE */
-
+#define FASTD_URING_POLL	((__u64) -1336)		/* Used as a magic value for marking a poll */
 
 typedef struct fastd_uring_priv {
 	fastd_poll_fd_t *fd;
@@ -59,8 +61,7 @@ int uring_read_flags;
 int uring_recvmsg_flags;
 
 struct io_uring_cqe *uring_cqes[URING_CQ_SIZE];
-int uring_cqe_count;
-int uring_cqe_pos;
+
 
 bool firstrun;
 
@@ -101,19 +102,22 @@ static inline void uring_priv_free(uring_priv_t *priv) {
 
 /** Submit pending io_uring submission entries */
 static int uring_submit(void) {
+	uring_debug("uring_submit()");
 	if(!ctx.uring_must_submit)
 		return 0;
+	uring_debug("uring_submit()1");
 	ctx.uring_must_submit = false;
 
-	int ret = io_uring_submit(&ctx.uring);
 
+	int ret = io_uring_submit(&ctx.uring);
+	uring_debug("uring_submit()2");
 	if (ret < 0) {
 		uring_debug("uring_submit() failed: %s\n", strerror(-ret));
 		exit_bug("uring_submit");
 	} else {
 		uring_debug("submitted %i SQEs", ret);
 	}
-
+	uring_debug("uring_submit()3");
 	if(ret == 0) {
 		exit_bug("submit without CQEs");
 	}
@@ -220,7 +224,7 @@ static inline void fastd_uring_schedule_add(uring_sched_op_t op, uring_priv_t *p
 	uring_sched_t **tail;
 	
 	priv->schedule.op = op;
-	pr_debug("Scheduling %p op=%i fd=%i", priv, op, priv->fd->fd);
+	uring_debug("Scheduling %p op=%i fd=%i", priv, op, priv->fd->fd);
 	if(priv->action == URING_OUTPUT) {
 		head = &priv->fd->output_queue.head;
 		tail = &priv->fd->output_queue.tail;
@@ -264,6 +268,14 @@ static void uring_schedule_execute(uring_sched_queue_t *queue) {
 
 		if(priv->action == URING_INPUT) {
 			priv->fd->input_pending++;
+			/* We add a poll to the beginning to mitigate access race conditions */
+/*
+			if(entry == queue->tail) {
+				io_uring_prep_poll_add(sqe, priv->fd->fd, POLLIN);
+				io_uring_sqe_set_flags(sqe, IOSQE_IO_HARDLINK);
+				sqe->user_data = FASTD_URING_POLL;
+				sqe = uring_get_sqe();
+			}*/
 
 			if(URING_OP_RECVMSG == priv->schedule.op) {
 				uring_debug("executing a RECVMSG");
@@ -275,6 +287,13 @@ static void uring_schedule_execute(uring_sched_queue_t *queue) {
 		} else {
 			priv->fd->output_pending++;
 			ctx.uring_output_pending++;
+/*
+			if(entry == queue->tail) {
+				io_uring_prep_poll_add(sqe, priv->fd->fd, POLLOUT);
+				io_uring_sqe_set_flags(sqe, IOSQE_IO_HARDLINK);
+				sqe->user_data = FASTD_URING_POLL;
+				sqe = uring_get_sqe();
+			}*/
 
 			if(URING_OP_SENDMSG == priv->schedule.op) {
 				uring_debug("executing a SENDMSG");
@@ -304,22 +323,6 @@ static void uring_schedule_execute(uring_sched_queue_t *queue) {
  *  will be called on completion of the operation and a pointer which will be handed to the
  *  callback function along with the result of the operation as parameters.
  */
-
-/** Used when the kernel doesn't support io_uring */
-void fastd_uring_accept_unsupported(fastd_poll_fd_t *fd, struct sockaddr *addr, socklen_t *addrlen, void *data, void (*cb)(ssize_t, void *)) {
-	cb(accept(fd->fd, addr, addrlen), data);
-}
-
-void fastd_uring_accept(fastd_poll_fd_t *fd, struct sockaddr *addr, socklen_t *addrlen, void *data, void (*cb)(ssize_t, void *)) {
-	struct io_uring_sqe *sqe = uring_get_sqe();
-	uring_priv_t *priv = uring_priv_new(fd, URING_INPUT, data, cb);
-
-	io_uring_prep_accept(sqe, fd->uring_idx, addr, addrlen, 0);
-	uring_priv_set(sqe, priv, IOSQE_FIXED_FILE);
-
-	ctx.uring_must_submit = true;
-	uring_submit();
-}
 
 /** Used when the kernel doesn't support io_uring */
 void fastd_uring_recvmsg_unsupported(fastd_poll_fd_t *fd, struct msghdr *msg, int flags, void *data, void (*cb)(ssize_t, void *)) {
@@ -378,10 +381,11 @@ void fastd_uring_write(fastd_poll_fd_t *fd, const void *buf, size_t count, void 
 }
 
 void uring_poll_add(fastd_poll_fd_t *fd, short poll_mask) {
+	uring_priv_t *priv = uring_priv_new(fd, URING_INPUT, NULL, NULL);
 	struct io_uring_sqe *sqe = uring_get_sqe();
 
 	io_uring_prep_poll_add(sqe, fd->fd, poll_mask);
-	uring_priv_set(sqe, (uring_priv_t *)&fd, 0);
+	uring_priv_set(sqe, priv, 0);
 	ctx.uring_must_submit = true;
 	uring_submit();
 }
@@ -395,6 +399,7 @@ void uring_poll_remove(fastd_poll_fd_t *fd) {
 	uring_submit();
 }
 
+
 /* Adds a timeout entry to the SQE queue */
 static inline void uring_timeout_add(int timeout) {
 	struct io_uring_sqe *sqe = uring_get_sqe();
@@ -406,6 +411,7 @@ static inline void uring_timeout_add(int timeout) {
 	io_uring_prep_timeout(sqe, &ts, 0, 0);
 	sqe->user_data = FASTD_URING_TIMEOUT;
 	ctx.uring_must_submit = true;
+	uring_submit();
 }
 
 /*    Input submission trigger
@@ -421,7 +427,7 @@ static inline void uring_sqe_input(fastd_poll_fd_t *fd) {
 			fastd_iface_t *iface = container_of(fd, fastd_iface_t, fd);
 
 			fastd_iface_handle(iface);
-				
+
 			break;
 		}
 	case POLL_TYPE_SOCKET: {
@@ -430,28 +436,27 @@ static inline void uring_sqe_input(fastd_poll_fd_t *fd) {
 			fastd_socket_t *sock = container_of(fd, fastd_socket_t, fd);
 
 			if(firstrun) {
+				firstrun = false;
 			/* FIXME The first batch of recvmsgs receive bogus data.
 			 * Thus we fill the queue only after receiving the first packet
 			 */
 				for(int i = 0; i < URING_RECVMSG_NUM; i++)
 					fastd_receive(sock);
-				firstrun = false;
 			} else {
 				fastd_receive(sock);
 			}
-
-			fastd_receive(sock);
 
 			break;
 		}
 	case POLL_TYPE_ASYNC:
 		uring_debug("async handle \n");
+		fastd_async_handle();
 		uring_poll_add(fd, POLLIN);
-
 		break;
 	case POLL_TYPE_STATUS:
 		uring_debug("status handle \n");
 		fastd_status_handle();
+		uring_poll_add(fd, POLLIN);
 		break;
 	default:
 		uring_debug("unknown FD type %i", fd->type);
@@ -463,40 +468,22 @@ static inline void uring_sqe_input(fastd_poll_fd_t *fd) {
 static inline void uring_cqe_handle(struct io_uring_cqe *cqe) {
 	uring_priv_t *priv = (uring_priv_t *)io_uring_cqe_get_data(cqe);
 
-	uring_debug("RETURNED CQE with result %i\n", cqe->res);
-
-	if (!priv)
-		exit_bug("uring_no_priv");
-
-	uring_debug("priv %p\n", priv);
-	uring_debug("fd type %i\n", priv->fd->type);
-	
-	if (priv->fd->type == POLL_TYPE_ASYNC) {
-		fastd_async_handle();
-		uring_sqe_input(priv->fd);
-		return;
-		/*FIXME*/
-	}
-
-	if (priv->action == URING_OUTPUT)  {
-		uring_debug("output\n");
+	if (priv->action == URING_OUTPUT) 
 		ctx.uring_output_pending--;
-	}
 
-	priv->caller_func(cqe->res, priv->caller_priv);
-	uring_debug("uring callback called\n");
+	if (priv->caller_func)
+		priv->caller_func(cqe->res, priv->caller_priv);
 	
 	if (priv->action == URING_OUTPUT)
 		goto free;
 
 	if (cqe->res < 0) {
-		uring_debug("CQE failed %s\n", strerror(-cqe->res));
-		if(priv->action == URING_INPUT && cqe->res == -11 && priv->fd->type == POLL_TYPE_SOCKET) {
-			pr_debug("sendmsg fail");
-		} else if(priv->action == URING_INPUT && cqe->res == -11 && priv->fd->type == POLL_TYPE_IFACE) {
-			pr_debug("recvmsg fail");
+		if(priv->action == URING_INPUT && cqe->res == -EAGAIN && priv->fd->type == POLL_TYPE_SOCKET) {
+			uring_debug("recvmsg fail");
+		} else if(priv->action == URING_INPUT && cqe->res == -EAGAIN && priv->fd->type == POLL_TYPE_IFACE) {
+			uring_debug("read fail");
 		} else {
-			pr_debug("res=%i", cqe->res);
+			pr_debug("res=%i fd-type=%i %p", cqe->res, priv->fd->type, priv);
 			exit_bug("CQE fail");
 		}
 	}
@@ -524,29 +511,13 @@ free:
 	uring_priv_free(priv);
 }
 
-static struct io_uring_cqe *uring_get_cqe() {
-	struct io_uring_cqe *cqe;
-	uring_cqe_pos++;
-
-	if (uring_cqe_pos < uring_cqe_count) {
-		if(ctx.uring_must_submit)
-			uring_submit();
-
-		return uring_cqes[uring_cqe_pos];
-	}
-	
-	if (uring_cqe_count)
-		io_uring_cq_advance(&ctx.uring, uring_cqe_count);
-
-	uring_debug("stopped %i/%i %i", uring_cqe_pos, uring_cqe_count, ctx.uring_output_pending);
-
+static uring_submit_prepare() {
 	uring_schedule_execute(&ctx.iface->fd.output_queue);
 
 	for (int i = 0; i < ctx.n_socks; i++) {
 		fastd_poll_fd_t *fd = &ctx.socks[i];
 		uring_schedule_execute(&fd->output_queue);
 	}
-	uring_submit();
 
 	if (!ctx.iface->fd.input_pending)
 		uring_schedule_execute(&ctx.iface->fd.input_queue);
@@ -556,24 +527,46 @@ static struct io_uring_cqe *uring_get_cqe() {
 		if (!fd->input_pending)
 			uring_schedule_execute(&fd->input_queue);
 	}
-	uring_submit();
+}
 
+static struct io_uring_cqe *uring_get_cqe() {
+	struct io_uring_cqe *cqe;
+	ctx.uring_cqe_pos++;
+
+	if (ctx.uring_cqe_pos < ctx.uring_cqe_count)
+		return uring_cqes[ctx.uring_cqe_pos];
+	
+	if (ctx.uring_cqe_count)
+		io_uring_cq_advance(&ctx.uring, ctx.uring_cqe_count);
+
+	uring_debug("stopped %i/%i %i", ctx.uring_cqe_pos, ctx.uring_cqe_count, ctx.uring_output_pending);
+	
 	if (io_uring_cq_ready(&ctx.uring) == 0) {
-		pr_debug("URINGENTER");
-		int ret = io_uring_wait_cqe_nr(&ctx.uring, &cqe, ctx.uring_output_pending + 1);
-		pr_debug("URINGRETURN");
-		if (ret != 0) {
-		    uring_debug("io_uring_wait_cqe ret=%i\n", ret);
+		uring_submit_prepare();
+		uring_debug("URINGENTER");
+		int ret;
+
+		if (ctx.uring_must_submit) {
+			uring_debug("submit_and_wait");
+			ret = io_uring_submit_and_wait(&ctx.uring, ctx.uring_output_pending + 1);
+			ctx.uring_must_submit = false;
+		} else  {
+			ret = io_uring_wait_cqe_nr(&ctx.uring, &cqe, ctx.uring_output_pending + 1);
+		}
+
+		uring_debug("URINGRETURN");
+		if (ret < 0) {
+		    pr_debug("io_uring_wait_cqe ret=%i\n", ret);
 		    exit_bug("io_uring_wait_cqe");
 		}
 	}
 
-	uring_cqe_count = io_uring_peek_batch_cqe(&ctx.uring, uring_cqes, sizeof(uring_cqes) / sizeof(uring_cqes[0]));
+	ctx.uring_cqe_count = io_uring_peek_batch_cqe(&ctx.uring, uring_cqes, sizeof(uring_cqes) / sizeof(uring_cqes[0]));
 
-	if(uring_cqe_count == 0)
+	if(ctx.uring_cqe_count == 0)
 		exit_bug("uring_nocqe");
 
-	uring_cqe_pos = 0;
+	ctx.uring_cqe_pos = 0;
 
 	return uring_cqes[0];
 }
@@ -583,40 +576,37 @@ void fastd_uring_handle(void) {
 	bool time_updated = false;
 	unsigned count = 0;
 
-	uring_debug("fastd_uring_handle() time remaining: %i ms", timeout);
+	sigset_t set, oldset;
+	sigemptyset(&set);
+	pthread_sigmask(SIG_SETMASK, &set, &oldset);
 
         uring_timeout_add(timeout);
-        
 	while(1) {
 		struct io_uring_cqe *cqe = uring_get_cqe();
+		count++;
 
 		if(!time_updated) {
 			fastd_update_time();
 			time_updated = true;
 		}
-		uring_debug("READY %i/%i %i", uring_cqe_pos + 1, uring_cqe_count, ctx.uring_output_pending);
-		count++;
-		if (cqe->user_data == FASTD_URING_TIMEOUT) {
-			uring_debug("timeout");
-			break;
-		}
 		
-		if(cqe->user_data)
+		if (FASTD_URING_TIMEOUT == cqe->user_data)
+			break;
+
+		if(cqe->user_data != FASTD_URING_POLL)
 			uring_cqe_handle(cqe);
 	}
 
-	uring_debug("HANDLED %i CQEs", count);
-	
-	/* SQEs will otherwise be submitted on the next call
-	 * to save a syscall
-	 */
+	uring_submit_prepare();
+	uring_submit();
+
+	pthread_sigmask(SIG_SETMASK, &oldset, NULL);
 }
 
 /*    File descriptor registration and teardown
  */
 
-fastd_poll_fd_t *async_fd;
-/* Initializes the fds and generates input cqes */
+/* Initializes the fds and generates input CQEs */
 void fastd_uring_fd_register(fastd_poll_fd_t *fd) {
 	if (fd->fd < 0)
 		exit_bug("fastd_uring_fd_register: invalid FD");
@@ -631,8 +621,10 @@ void fastd_uring_fd_register(fastd_poll_fd_t *fd) {
 				fastd_iface_handle(iface);
 
 			/* FIXME non-fixed files can only be used after registration of all fixed files?! */
-			uring_sqe_input(async_fd);
-			
+			if(ctx.status_fd.fd != -1)
+				uring_poll_add(&ctx.status_fd, POLLIN);
+			uring_poll_add(&ctx.async_rfd, POLLIN);
+
 			break;
 	case POLL_TYPE_SOCKET: {
 			uring_fixed_file_register(fd);
@@ -643,16 +635,11 @@ void fastd_uring_fd_register(fastd_poll_fd_t *fd) {
 			fastd_socket_t *sock = container_of(fd, fastd_socket_t, fd);
 
 			fastd_receive(sock);
+
 			break;
 		}
 	case POLL_TYPE_ASYNC:
-		async_fd = fd;
-		//uring_sqe_input(fd);
-
-		break;
 	case POLL_TYPE_STATUS:
-		uring_sqe_input(fd);
-
 		break;
 	default:
 		uring_debug("uring wrong fd type received %i", fd->type);
@@ -661,7 +648,14 @@ void fastd_uring_fd_register(fastd_poll_fd_t *fd) {
 }
 
 bool fastd_uring_fd_close(fastd_poll_fd_t *fd) {
-	/* TODO: Block new input, insert a flush and only close it afterwards Hint: Set fixed file index -1 */
+	/* FIXME: Block new input, insert a flush and only close it afterwards Hint: Set fixed file index -1 */
+	
+	switch(fd->type) {
+	case POLL_TYPE_ASYNC:
+	case POLL_TYPE_STATUS:
+		uring_poll_remove(fd);
+		break;
+	}
 
 	return (close(fd->fd) == 0);
 }
@@ -676,17 +670,11 @@ void fastd_uring_init(void) {
 		ctx.func_fd_close = fastd_poll_fd_close;
 		ctx.func_io_handle = fastd_poll_handle;
 		ctx.func_io_free = fastd_poll_free;
-		ctx.func_accept = fastd_uring_accept_unsupported;
 		fastd_poll_init();
 
 		return;
 	}
 
-	fastd_poll_init();
-	uring_recvmsg_flags = 0;
-	uring_read_flags = 0;
-	uring_cqe_count = 0;
-	uring_cqe_pos = 0;
 	ctx.func_recvmsg = fastd_uring_recvmsg;
 	ctx.func_sendmsg = fastd_uring_sendmsg;
 	ctx.func_read = fastd_uring_read;
@@ -695,7 +683,6 @@ void fastd_uring_init(void) {
 	ctx.func_fd_close = fastd_uring_fd_close;
 	ctx.func_io_handle = fastd_uring_handle;
 	ctx.func_io_free = fastd_uring_free;
-	ctx.func_accept = fastd_uring_accept;
 
 	memset(&ctx.uring_params, 0, sizeof(ctx.uring_params));
 
